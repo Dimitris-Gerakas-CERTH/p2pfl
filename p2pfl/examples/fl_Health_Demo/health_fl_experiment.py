@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-Federated Learning for Health Data - HR Prediction
+Federated Learning for Health Data - HR Prediction with Adversarial Nodes
 
 This script implements a federated learning experiment where each patient's
 data is treated as a separate node. The model predicts heart rate (HR) from
 accelerometer data (axis1, axis2, axis3) using a sliding window approach.
 
+Supports adversarial/poisoned nodes for security research.
+
 Based on the p2pfl library structure from the MNIST example.
 
 Usage:
+    # Clean experiment
     python health_fl_experiment.py --nodes 5 --rounds 3 --topology full
-    python health_fl_experiment.py --nodes 10 --rounds 5 --reduced_dataset
+    
+    # With poisoned nodes
+    python health_fl_experiment.py --nodes 5 --rounds 3 --poisoned 2 --attack label_noise
+    
+    # Compare clean vs poisoned
+    python health_fl_experiment.py --nodes 5 --rounds 3 --poisoned 2 --compare
 """
 
 import argparse
@@ -41,6 +49,15 @@ from health_data_module import (
     create_train_test_split,
     HealthTimeSeriesDataset,
     HRPredictorMLP,
+)
+
+# Poisoning imports
+from health_poisoning import (
+    PoisonConfig,
+    PoisonStrategy,
+    DataPoisoner,
+    get_available_strategies,
+    create_poisoner_from_args,
 )
 
 
@@ -82,6 +99,8 @@ class PatientDataset:
     n_train_samples: int
     n_test_samples: int
     norm_stats: Dict
+    is_poisoned: bool = False
+    poison_stats: Optional[Dict] = None
 
 
 def prepare_patient_datasets(
@@ -90,7 +109,9 @@ def prepare_patient_datasets(
     window_size: int = 10,
     train_ratio: float = 0.8,
     reduced: bool = False,
-    reduced_fraction: float = 0.1
+    reduced_fraction: float = 0.1,
+    num_poisoned: int = 0,
+    poison_config: Optional[PoisonConfig] = None,
 ) -> List[PatientDataset]:
     """
     Prepare datasets for multiple patients using p2pfl's P2PFLDataset.
@@ -102,6 +123,8 @@ def prepare_patient_datasets(
         train_ratio: Fraction of data for training
         reduced: Whether to use reduced dataset
         reduced_fraction: Fraction of data to use if reduced
+        num_poisoned: Number of nodes to poison (first N nodes will be poisoned)
+        poison_config: Configuration for poisoning attacks
         
     Returns:
         List of PatientDataset objects
@@ -116,10 +139,55 @@ def prepare_patient_datasets(
     print(f"   Train/Test ratio: {train_ratio}/{1-train_ratio}")
     print(f"   Reduced dataset: {reduced} ({reduced_fraction*100:.0f}% if enabled)")
     
+    if num_poisoned > 0 and poison_config:
+        print(f"   ☠️  Poisoned nodes: {num_poisoned}/{num_patients}")
+        print(f"   ☠️  Attack strategy: {poison_config.strategy.value}")
+        print(f"   ☠️  Poison rate: {poison_config.poison_rate*100:.0f}%")
+    
+    # Create poisoner if needed
+    poisoner = DataPoisoner(poison_config) if poison_config and num_poisoned > 0 else None
+    
     for patient_id in range(1, num_patients + 1):
         try:
+            # Determine if this node should be poisoned
+            is_poisoned = patient_id <= num_poisoned and poisoner is not None
+            
             # Load patient data
             df = load_patient_data(data_dir, patient_id, reduced, reduced_fraction)
+            
+            # Apply poisoning BEFORE train/test split (poisons training data)
+            poison_stats = None
+            if is_poisoned:
+                # Store original stats for comparison
+                original_hr_mean = df['hr'].mean()
+                original_hr_std = df['hr'].std()
+                original_hr_min = df['hr'].min()
+                original_hr_max = df['hr'].max()
+                
+                # Apply poisoning
+                df, poison_stats = poisoner.poison(df)
+                
+                # Calculate post-poison stats
+                poisoned_hr_mean = df['hr'].mean()
+                poisoned_hr_std = df['hr'].std()
+                poisoned_hr_min = df['hr'].min()
+                poisoned_hr_max = df['hr'].max()
+                
+                # Add comparison to poison_stats
+                poison_stats['original_hr_mean'] = original_hr_mean
+                poison_stats['original_hr_std'] = original_hr_std
+                poison_stats['poisoned_hr_mean'] = poisoned_hr_mean
+                poison_stats['poisoned_hr_std'] = poisoned_hr_std
+                poison_stats['hr_mean_change'] = poisoned_hr_mean - original_hr_mean
+                poison_stats['hr_std_change'] = poisoned_hr_std - original_hr_std
+                
+                # Print verification
+                print(f"\n   ☠️  POISONING VERIFICATION - Patient {patient_id:02d}:")
+                print(f"      Attack: {poison_stats.get('attack', 'unknown')}")
+                print(f"      Samples poisoned: {poison_stats.get('samples_poisoned', 0):,}/{poison_stats.get('total_samples', 0):,}")
+                print(f"      HR Before: mean={original_hr_mean:.2f}, std={original_hr_std:.2f}, range=[{original_hr_min:.1f}, {original_hr_max:.1f}]")
+                print(f"      HR After:  mean={poisoned_hr_mean:.2f}, std={poisoned_hr_std:.2f}, range=[{poisoned_hr_min:.1f}, {poisoned_hr_max:.1f}]")
+                print(f"      HR Change: mean={poison_stats['hr_mean_change']:+.2f}, std={poison_stats['hr_std_change']:+.2f}")
             
             # Split into train/test (sequential for time series!)
             train_df, test_df = create_train_test_split(df, train_ratio)
@@ -172,11 +240,16 @@ def prepare_patient_datasets(
                 p2pfl_dataset=p2pfl_dataset,
                 n_train_samples=len(train_torch_dataset),
                 n_test_samples=len(test_torch_dataset),
-                norm_stats=norm_stats
+                norm_stats=norm_stats,
+                is_poisoned=is_poisoned,
+                poison_stats=poison_stats
             )
             
             datasets.append(patient_data)
-            print(f"   ✓ Patient {patient_id:02d}: {len(train_torch_dataset):,} train, {len(test_torch_dataset):,} test samples")
+            
+            # Print with poison indicator
+            poison_indicator = " ☠️ POISONED" if is_poisoned else ""
+            print(f"   ✓ Patient {patient_id:02d}: {len(train_torch_dataset):,} train, {len(test_torch_dataset):,} test samples{poison_indicator}")
             
         except FileNotFoundError as e:
             print(f"   ✗ Patient {patient_id:02d}: File not found - {e}")
@@ -189,6 +262,11 @@ def prepare_patient_datasets(
     total_train = sum(d.n_train_samples for d in datasets)
     total_test = sum(d.n_test_samples for d in datasets)
     print(f"   Total samples: {total_train:,} train, {total_test:,} test")
+    
+    # Print poisoning summary
+    poisoned_count = sum(1 for d in datasets if d.is_poisoned)
+    if poisoned_count > 0:
+        print(f"   ☠️  Poisoned nodes: {poisoned_count}/{len(datasets)}")
     
     return datasets
 
@@ -315,12 +393,19 @@ def print_results_summary(
     num_rounds: int,
     topology: str,
     execution_time: float,
-    reduced: bool
+    reduced: bool,
+    num_poisoned: int = 0,
+    poison_config: Optional[PoisonConfig] = None
 ) -> None:
     """Print a summary of experiment results."""
     
+    is_poisoned = num_poisoned > 0 and poison_config is not None
+    
     print("\n" + "=" * 70)
-    print("📊 FEDERATED LEARNING RESULTS - HR PREDICTION")
+    if is_poisoned:
+        print("📊 FEDERATED LEARNING RESULTS - HR PREDICTION (POISONED)")
+    else:
+        print("📊 FEDERATED LEARNING RESULTS - HR PREDICTION (CLEAN)")
     print("=" * 70)
     
     print(f"\n🔧 Configuration:")
@@ -329,6 +414,24 @@ def print_results_summary(
     print(f"   Topology: {topology}")
     print(f"   Reduced Dataset: {reduced}")
     print(f"   Execution Time: {execution_time:.2f}s")
+    
+    # Poisoning details
+    if is_poisoned:
+        print(f"\n☠️  Poisoning Configuration:")
+        print(f"   Poisoned Nodes: {num_poisoned}/{num_nodes} ({num_poisoned/num_nodes*100:.1f}%)")
+        print(f"   Attack Type: {poison_config.strategy.value}")
+        print(f"   Poison Rate: {poison_config.poison_rate*100:.0f}% of samples")
+        
+        # Show attack-specific parameters
+        if poison_config.strategy in [PoisonStrategy.LABEL_NOISE, PoisonStrategy.FEATURE_NOISE, 
+                                       PoisonStrategy.COMBINED_SUBTLE, PoisonStrategy.COMBINED_AGGRESSIVE]:
+            print(f"   Noise Std: {poison_config.noise_std}")
+        if poison_config.strategy == PoisonStrategy.TEMPORAL_SHIFT:
+            print(f"   Temporal Shift: {poison_config.temporal_shift_steps} steps")
+        if poison_config.strategy == PoisonStrategy.LABEL_CONSTANT:
+            print(f"   Constant Value: {poison_config.constant_value}")
+    else:
+        print(f"\n✅ Clean Experiment (No Poisoning)")
     
     if not rounds_data:
         print("\n⚠️  No results to display")
@@ -400,7 +503,9 @@ def run_health_fl_experiment(
     protocol: str = "memory",
     aggregator: str = "fedavg",
     reduced: bool = False,
-    reduced_fraction: float = 0.1
+    reduced_fraction: float = 0.1,
+    num_poisoned: int = 0,
+    poison_config: Optional[PoisonConfig] = None,
 ) -> Dict[int, Dict[str, Any]]:
     """
     Run a federated learning experiment for HR prediction.
@@ -417,14 +522,26 @@ def run_health_fl_experiment(
         aggregator: Aggregation strategy (fedavg/scaffold)
         reduced: Use reduced dataset
         reduced_fraction: Fraction of data to use if reduced
+        num_poisoned: Number of nodes to poison
+        poison_config: Configuration for poisoning attacks
         
     Returns:
         Dictionary with results per round
     """
+    # Determine experiment type
+    is_poisoned_experiment = num_poisoned > 0 and poison_config is not None
+    
     print("\n" + "=" * 70)
-    print("🏥 FEDERATED LEARNING - HEART RATE PREDICTION")
+    if is_poisoned_experiment:
+        print("☠️  FEDERATED LEARNING - HR PREDICTION (POISONED EXPERIMENT)")
+    else:
+        print("🏥 FEDERATED LEARNING - HEART RATE PREDICTION")
     print("=" * 70)
     print(f"\n   Patients/Nodes: {num_nodes}")
+    if is_poisoned_experiment:
+        print(f"   ☠️  Poisoned Nodes: {num_poisoned} ({num_poisoned/num_nodes*100:.1f}%)")
+        print(f"   ☠️  Attack: {poison_config.strategy.value}")
+        print(f"   ☠️  Poison Rate: {poison_config.poison_rate*100:.0f}%")
     print(f"   Rounds: {num_rounds}")
     print(f"   Epochs/Round: {epochs_per_round}")
     print(f"   Topology: {topology.value}")
@@ -436,6 +553,9 @@ def run_health_fl_experiment(
     if num_nodes > Settings.TTL:
         raise ValueError("Number of nodes exceeds TTL setting")
     
+    if num_poisoned > num_nodes:
+        raise ValueError(f"num_poisoned ({num_poisoned}) cannot exceed num_nodes ({num_nodes})")
+    
     # Prepare datasets for all patients
     patient_datasets = prepare_patient_datasets(
         data_dir=data_dir,
@@ -443,7 +563,9 @@ def run_health_fl_experiment(
         window_size=window_size,
         train_ratio=0.8,
         reduced=reduced,
-        reduced_fraction=reduced_fraction
+        reduced_fraction=reduced_fraction,
+        num_poisoned=num_poisoned,
+        poison_config=poison_config
     )
     
     if len(patient_datasets) < num_nodes:
@@ -461,9 +583,10 @@ def run_health_fl_experiment(
         # Create model
         model = create_hr_predictor_model(window_size=window_size)
         
-        # Node address
+        # Node address (add poison indicator)
         if protocol == "memory":
-            address = f"patient-{patient_data.patient_id:02d}"
+            poison_suffix = "-☠️" if patient_data.is_poisoned else ""
+            address = f"patient-{patient_data.patient_id:02d}{poison_suffix}"
             protocol_class = InMemoryCommunicationProtocol
         else:
             address = "127.0.0.1"
@@ -484,7 +607,12 @@ def run_health_fl_experiment(
         )
         node.start()
         nodes.append(node)
-        print(f"   ✓ Patient {patient_data.patient_id:02d} node started ({patient_data.n_train_samples:,} samples)")
+        poison_indicator = " ☠️" if patient_data.is_poisoned else ""
+        print(f"   ✓ Patient {patient_data.patient_id:02d} node started ({patient_data.n_train_samples:,} samples){poison_indicator}")
+        
+        # Delay to avoid race conditions in p2pfl threading
+        # Increased to 1.0s for stability with more nodes
+        time.sleep(1.0)
     
     results = {}
     
@@ -526,7 +654,9 @@ def run_health_fl_experiment(
         num_rounds,
         topology.value,
         execution_time,
-        reduced
+        reduced,
+        num_poisoned=num_poisoned,
+        poison_config=poison_config
     )
     
     return results
@@ -545,14 +675,34 @@ Examples:
     # Basic run with 5 patients
     python health_fl_experiment.py --nodes 5 --rounds 3
     
-    # Quick test with reduced dataset
-    python health_fl_experiment.py --nodes 3 --rounds 2 --reduced_dataset
+    # Quick demo (5%% data - fastest, for presentations)
+    python health_fl_experiment.py --nodes 3 --rounds 2 --quick
     
-    # Full experiment with all patients
-    python health_fl_experiment.py --nodes 22 --rounds 10 --topology full
+    # Reduced dataset (10%% data - balanced speed/accuracy)
+    python health_fl_experiment.py --nodes 3 --rounds 3 --reduced_dataset
     
-    # Different topology
-    python health_fl_experiment.py --nodes 5 --rounds 5 --topology star
+    # With poisoned nodes (label noise attack)
+    python health_fl_experiment.py --nodes 5 --rounds 3 --poisoned 2 --attack label_noise --quick
+    
+    # Aggressive attack with high poison rate
+    python health_fl_experiment.py --nodes 5 --poisoned 2 --attack label_flip --quick
+    
+    # Different topologies
+    python health_fl_experiment.py --nodes 5 --rounds 5 --topology star --reduced_dataset
+
+Dataset size options:
+    (none)            - Full dataset (100%%)
+    --reduced_dataset - Reduced dataset (10%%, ~6k samples/patient)
+    --quick           - Minimal dataset (5%%, ~3k samples/patient) - FASTEST
+
+Available attack strategies:
+    label_noise      - Add Gaussian noise to HR targets
+    label_flip       - Flip HR values (high becomes low)
+    label_constant   - Replace HR with constant value
+    feature_noise    - Add noise to accelerometer data
+    temporal_shift   - Shift HR labels in time
+    combined_subtle  - Subtle combination attack
+    combined_aggressive - Aggressive multi-vector attack
         """
     )
     
@@ -561,6 +711,8 @@ Examples:
                        help='Directory with cleaned patient CSVs')
     parser.add_argument('--reduced_dataset', action='store_true',
                        help='Use reduced dataset (10%%) for faster testing')
+    parser.add_argument('--quick', action='store_true',
+                       help='Use minimal dataset (5%%) for quick demos/presentations')
     parser.add_argument('--reduced_fraction', type=float, default=0.1,
                        help='Fraction of data to use if reduced (default: 0.1)')
     
@@ -589,6 +741,17 @@ Examples:
                        choices=['fedavg', 'scaffold'],
                        help='Aggregation strategy (default: fedavg)')
     
+    # Poisoning settings
+    parser.add_argument('--poisoned', type=int, default=0,
+                       help='Number of poisoned nodes (default: 0)')
+    parser.add_argument('--attack', type=str, default='label_noise',
+                       choices=get_available_strategies(),
+                       help='Attack strategy (default: label_noise)')
+    parser.add_argument('--poison_rate', type=float, default=1.0,
+                       help='Fraction of samples to poison per node (default: 1.0)')
+    parser.add_argument('--noise_std', type=float, default=0.5,
+                       help='Noise standard deviation for noise attacks (default: 0.5)')
+    
     # Other
     parser.add_argument('--disable_ray', action='store_true',
                        help='Disable Ray for parallel processing')
@@ -609,6 +772,29 @@ if __name__ == "__main__":
     # Parse topology
     topology = TopologyType(args.topology)
     
+    # Handle dataset size options
+    # --quick overrides --reduced_dataset with 5% (1/20th)
+    # --reduced_dataset uses 10% (1/10th)
+    if args.quick:
+        use_reduced = True
+        reduced_fraction = 0.05  # 5% = 1/20th of data
+    elif args.reduced_dataset:
+        use_reduced = True
+        reduced_fraction = args.reduced_fraction  # Default 10%
+    else:
+        use_reduced = False
+        reduced_fraction = 1.0
+    
+    # Create poison config if poisoning is enabled
+    poison_config = None
+    if args.poisoned > 0:
+        poison_config = PoisonConfig(
+            strategy=PoisonStrategy(args.attack),
+            poison_rate=args.poison_rate,
+            noise_std=args.noise_std,
+            seed=42  # For reproducibility
+        )
+    
     # Run experiment
     run_health_fl_experiment(
         data_dir=Path(args.data_dir),
@@ -620,6 +806,8 @@ if __name__ == "__main__":
         topology=topology,
         protocol=args.protocol,
         aggregator=args.aggregator,
-        reduced=args.reduced_dataset,
-        reduced_fraction=args.reduced_fraction,
+        reduced=use_reduced,
+        reduced_fraction=reduced_fraction,
+        num_poisoned=args.poisoned,
+        poison_config=poison_config,
     )
